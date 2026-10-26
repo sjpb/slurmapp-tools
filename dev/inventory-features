@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""
+Show which features are enabled in the current environment.
+
+Features are enabled by adding groups to the group named for the feature, e.g.
+`nfs` or `sssd`. For each group in the current environment's inventory (the
+chain defined by `inventory` in $APPLIANCES_ENVIRONMENT_ROOT/ansible.cfg) this
+shows the groups it ultimately resolves to, e.g.:
+
+    nfs: openhpc
+    systemd: control
+    squid: stg_squid (additional)
+
+Groups are followed through, not listed as-is: `systemd` contains `opensearch`,
+which contains `control`, so it is shown as `systemd: control`. Following stops
+at either:
+  - a root group: cluster, openhpc, login, control, compute, additional or
+    fatimage, or
+  - a nodegroup, i.e. a group directly containing hosts. These are shown with
+    the root group they sit under, as in `stg_squid (additional)` above.
+No distinction is made between groups which enable a feature and groups which
+only organise nodegroups, as an environment may use a group for either.
+
+Groups with no hosts are not shown, as they have no effect. The environment's
+inventory must therefore contain hosts (i.e. tofu must have been run), unless
+--assume-hosts is used.
+
+Requires `ansible-inventory` on the PATH and $APPLIANCES_ENVIRONMENT_ROOT to
+be set (i.e. the environment must be activated). The repo is taken from
+$APPLIANCES_REPO_ROOT if set, otherwise the repo containing this script. Any
+inventory files read which are not tracked by git are reported as a warning.
+"""
+
+import argparse
+import configparser
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REPO_ROOT = Path(
+    os.environ.get("APPLIANCES_REPO_ROOT") or Path(__file__).resolve().parent.parent
+).resolve()
+ROOT_GROUP = "cluster"  # top of the appliance's group tree, defined in common
+IGNORED_GROUPS = {"all", "ungrouped"}
+
+
+def die(msg):
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd, **kwargs):
+    result = subprocess.run(cmd, capture_output=True, **kwargs)
+    if result.returncode:
+        stderr = result.stderr
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        die(f"{' '.join(cmd)} failed:\n{stderr}")
+    return result.stdout
+
+
+def get_group_children(env, args=()):
+    """Return dicts of group name -> child group names and group name -> hosts.
+
+    This parses `ansible-inventory --graph` rather than using `--list`, as only
+    the former avoids loading (and therefore decrypting) any group/host vars.
+    """
+    env = {**os.environ, "ANSIBLE_INVENTORY_UNPARSED_FAILED": "true", **env}
+    out = run(["ansible-inventory", "--graph", *args], env=env, text=True)
+    children = {}
+    hosts = {}
+    stack = []  # names of the groups containing the current line, outermost first
+    for line in out.splitlines():
+        match = re.fullmatch(r"((?:  )?(?:\|  )*)(?:\|--)?(@?)(.+?):?", line)
+        if not match:
+            die(f"unable to parse ansible-inventory --graph output: {line!r}")
+        prefix, is_group, name = match.groups()
+        depth = (len(prefix) + 1) // 3 if prefix else 0
+        del stack[depth:]
+        if not is_group:
+            hosts.setdefault(stack[-1], set()).add(name)
+            continue
+        children.setdefault(name, [])
+        if stack and name not in children[stack[-1]]:
+            children[stack[-1]].append(name)
+        stack.append(name)
+    return children, hosts
+
+
+def descendants(children, name):
+    """Return the names of all groups below `name`, not including itself."""
+    found = set()
+    todo = list(children.get(name, []))
+    while todo:
+        child = todo.pop()
+        if child not in found:
+            found.add(child)
+            todo.extend(children.get(child, []))
+    return found
+
+
+def ancestors(children, name):
+    """Return the names of all groups which contain `name`, not including itself."""
+    return {group for group in children if name in descendants(children, group)}
+
+
+def has_hosts(children, hosts, name):
+    """Return whether the group, or any group below it, contains any hosts."""
+    return any(hosts.get(group) for group in descendants(children, name) | {name})
+
+
+def inventory_graph(inventories):
+    """Return group children for the given inventory directories, ignoring any
+    ansible.cfg (and so any other inventory configuration)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Path(tmp) / "ansible.cfg"
+        cfg.write_text("[defaults]\n")
+        args = []
+        for inventory in inventories:
+            args += ["-i", str(inventory)]
+        return get_group_children({"ANSIBLE_CONFIG": str(cfg)}, args)[0]
+
+
+def baseline_children(ref):
+    """Return group children of upstream common + site, taken from git ref."""
+    check = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(REPO_ROOT),
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"{ref}^{{commit}}",
+        ],
+        capture_output=True,
+    )
+    if check.returncode:
+        die(f"upstream ref '{ref}' not found in {REPO_ROOT} - use --upstream REF")
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = run(
+            [
+                "git",
+                "-C",
+                str(REPO_ROOT),
+                "archive",
+                ref,
+                "environments/common",
+                "environments/site",
+            ]
+        )
+        subprocess.run(["tar", "-x", "-C", tmp], input=archive, check=True)
+        return inventory_graph(
+            Path(tmp) / "environments" / env / "inventory" for env in ("common", "site")
+        )
+
+
+def inventory_dirs(env_root):
+    """Return the inventory directories listed in the environment's ansible.cfg."""
+    cfg_path = env_root / "ansible.cfg"
+    if not cfg_path.exists():
+        die(f"{cfg_path} not found")
+    cfg = configparser.ConfigParser(interpolation=None)
+    cfg.read(cfg_path)
+    value = cfg.get("defaults", "inventory", fallback=None)
+    if not value:
+        die(f"no `inventory` defined in [defaults] in {cfg_path}")
+    return [(env_root / path.strip()).resolve() for path in value.split(",")]
+
+
+def untracked_files(dirs):
+    """Return untracked files (relative to the repo root) under the given dirs."""
+    paths = []
+    for path in dirs:
+        try:
+            paths.append(str(path.relative_to(REPO_ROOT)))
+        except ValueError:
+            continue  # outside the repo, git can't tell us anything
+    if not paths:
+        return []
+    out = run(
+        [
+            "git",
+            "-C",
+            str(REPO_ROOT),
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "--",
+            *paths,
+        ],
+        text=True,
+    )
+    return out.splitlines()
+
+
+def annotate(name, roots, common, current):
+    """Annotate a group with the most specific root group(s) it sits under, if any.
+
+    For groups defined by the environment (i.e. not in common) the groups they
+    contain are considered too, as these are commonly groups-of-nodegroups which
+    are not themselves in the root tree.
+    """
+    if name in roots:
+        return name
+    parents = ancestors(current, name) & roots
+    if name not in common:
+        for child in descendants(current, name):
+            parents |= ancestors(current, child) & roots
+    # the most specific parents are those which have no other parent below them
+    leafmost = sorted(
+        p for p in parents if not (descendants(current, p) & (parents - {p}))
+    )
+    return f"{name} ({', '.join(leafmost)})" if leafmost else name
+
+
+def follow(name, roots, hosts, current, seen=()):
+    """Yield the groups which `name` ultimately resolves to.
+
+    Groups are replaced by the groups they contain, recursively, so e.g.
+    systemd -> opensearch -> control gives control. This stops at a root group,
+    or at a group which directly contains hosts (i.e. a nodegroup) or which
+    contains no groups.
+    """
+    if name in roots or hosts.get(name) or not current.get(name):
+        yield name
+        return
+    for child in current[name]:
+        if child not in seen and child != name:
+            yield from follow(child, roots, hosts, current, seen + (name,))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--diff",
+        action="store_true",
+        help="only show what differs from upstream's environments/common and "
+        "environments/site, i.e. the non-default features",
+    )
+    parser.add_argument(
+        "--upstream",
+        default="upstream",
+        metavar="REF",
+        help="git ref of the upstream appliance to compare with for --diff "
+        "(default: %(default)s)",
+    )
+    parser.add_argument(
+        "--assume-hosts",
+        nargs="+",
+        default=[],
+        metavar="GROUP",
+        help="show what would be enabled for a host in just these groups: the "
+        "environment's real hosts are ignored and a host is assumed to be in each "
+        "group. For an image build use the groups which the packer builder adds "
+        "its host to, e.g. `--assume-hosts builder doca raid`, or `fatimage` which "
+        "the site groups put under login, control and compute.",
+    )
+    args = parser.parse_args()
+
+    if not os.environ.get("APPLIANCES_ENVIRONMENT_ROOT"):
+        die("APPLIANCES_ENVIRONMENT_ROOT is not set - activate an environment first")
+    env_root = Path(os.environ["APPLIANCES_ENVIRONMENT_ROOT"]).resolve()
+
+    current, hosts = get_group_children(
+        {"ANSIBLE_CONFIG": str(env_root / "ansible.cfg")}
+    )
+    if args.assume_hosts:
+        hosts = {}  # only the assumed hosts exist, not the environment's real ones
+    for group in args.assume_hosts:
+        if group not in current:
+            die(f"--assume-hosts: group '{group}' not found in the inventory")
+        hosts.setdefault(group, set()).add(f"(assumed host in {group})")
+    if not any(hosts.values()):
+        die("no hosts in the inventory - has tofu been run? (or use --assume-hosts)")
+
+    # The root groups are those defined in common which make up the cluster tree.
+    # Common is never modified by forks, so reading it from disk is ok.
+    common = set(inventory_graph([REPO_ROOT / "environments/common/inventory"]))
+    if ROOT_GROUP not in current:
+        die(f"group '{ROOT_GROUP}' not found in the inventory")
+    roots = ({ROOT_GROUP} | descendants(current, ROOT_GROUP)) & common
+
+    baseline = baseline_children(args.upstream) if args.diff else {}
+
+    lines = {group: ["(assumed host)"] for group in args.assume_hosts}
+    for name in sorted(set(current) - roots - IGNORED_GROUPS):
+        found = []
+        for child in current.get(name, []):
+            if args.diff and child in baseline.get(name, []):
+                continue  # same as upstream
+            for group in follow(child, roots, hosts, current):
+                if group not in found and has_hosts(current, hosts, group):
+                    found.append(group)
+        if found:
+            shown = [annotate(group, roots, common, current) for group in found]
+            lines.setdefault(name, []).extend(shown)
+    for name in sorted(lines):
+        print(f"{name}: {', '.join(lines[name])}")
+
+    untracked = untracked_files(inventory_dirs(env_root))
+    if untracked:
+        print(
+            "WARNING: untracked inventory files were read: " + ", ".join(untracked),
+            file=sys.stderr,
+        )
+
+
+if __name__ == "__main__":
+    main()
