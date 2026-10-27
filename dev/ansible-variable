@@ -6,6 +6,7 @@ Show an Ansible variable value.
 import argparse
 import subprocess
 import json
+import glob
 from pathlib import Path
 
 class bcolors:
@@ -17,12 +18,12 @@ def load_ansible_cfg():
     txt = subprocess.check_output(["ansible-config", "dump", "--format", "json"], text=True)
     return {obj["name"]: obj["value"] for obj in json.loads(txt)}
 
-def grep_yml(pattern, base, pathglob):
-    for path in Path(base).glob(pathglob):
-        with path.open() as f:
+def grep_yml(pattern, pathglob):
+    for path in glob.glob(pathglob, recursive=True):
+        with open(path) as f:
             for line in f:
                 if pattern in line:
-                    yield path, line.rstrip("\n")
+                    yield f"{path} {line.rstrip('\n')}"
 
 def relpath(p):
     return p.relative_to(Path.cwd())
@@ -67,8 +68,9 @@ if __name__ == "__main__":
         print("role defaults:")
         #print("roles_path:", roles_paths)
         for path in roles_paths:
-            for subpath, match in grep_yml(yml_pattern, path, "*/defaults/**/*.yml"):
-                pprint_match(subpath, match, yml_pattern)
+            for match in grep_yml(yml_pattern, f"{path}/*/defaults/**/*.yml"):
+                print(match)
+                #pprint_match(subpath, match, yml_pattern)
         # TODO:
         #print("collections_paths:", collections_paths)
         
@@ -77,21 +79,23 @@ if __name__ == "__main__":
         #print("inventory_paths:", inventory_paths)
         # TODO: ini_pattern
         for path in inventory_paths:
-            for subpath, match in grep_yml(ini_pattern, path, "hosts"):
-                pprint_match(subpath, match, ini_pattern)
+            for match in grep_yml(ini_pattern, f"{path}/hosts"):
+                print(match)
+                #pprint_match(subpath, match, ini_pattern)
         for path in inventory_paths:
-                    for subpath, match in grep_yml(yml_pattern, path, "*.yml"):
-                        pprint_match(subpath, match, yml_pattern)
+                for match in grep_yml(yml_pattern, f"{path}/*.yml"):
+                    print(match)
+                    #pprint_match(subpath, match, yml_pattern)
         for path in inventory_paths:
-            for subpath, match in grep_yml(yml_pattern, path, "group_vars/all/*.yml"):
-                pprint_match(subpath, match, yml_pattern)
+            for match in grep_yml(yml_pattern, f"{path}/group_vars/all/*.yml"):
+                print(match)
+                #pprint_match(subpath, match, yml_pattern)
 
         print()
         print("final:")
         inventory_stdout = subprocess.check_output(["ansible-inventory", "--host", host], text=True)
         json_inventory = json.loads(inventory_stdout)
         if args.var in json_inventory:
-            print("  expression:", json_inventory[args.var]) # TODO: also print as json? Or yaml??
-        
-        print("  value:", json.dumps(value, indent=2))
+            print("expression:", json_inventory[args.var]) # TODO: also print as json? Or yaml??
+        print("value:", json.dumps(value, indent=2))
 
