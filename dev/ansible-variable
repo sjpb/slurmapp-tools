@@ -6,21 +6,92 @@ Show an Ansible variable value.
 import argparse
 import subprocess
 import json
+from pathlib import Path
+
+class bcolors:
+    PURPLE = '\033[35m'
+    RED = '\033[31m'
+    ENDC = '\033[0m'
+
+def load_ansible_cfg():
+    txt = subprocess.check_output(["ansible-config", "dump", "--format", "json"], text=True)
+    return {obj["name"]: obj["value"] for obj in json.loads(txt)}
+
+def grep_yml(pattern, base, pathglob):
+    for path in Path(base).glob(pathglob):
+        with path.open() as f:
+            for line in f:
+                if pattern in line:
+                    yield path, line.rstrip("\n")
+
+def relpath(p):
+    return p.relative_to(Path.cwd())
+
+def pprint_match(path, match, pattern, indent=2):
+    idx = match.find(pattern)
+    # grep-style coloring: purple path, red match, black rest of line
+    text = match[:idx] + bcolors.RED + match[idx:idx+len(pattern)] + bcolors.ENDC + match[idx+len(pattern):]
+    print(f"{' ' * indent }{bcolors.PURPLE}{ relpath(path) }{bcolors.ENDC}: { text }")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter) # formatter needed to get default messages
     parser.add_argument("--host", help="host or group", default="localhost")
-    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--debug", action="store_true", help="search for definitions")
+    parser.add_argument("--all", action="store_true", help="search for all usages, including partial matches")
     parser.add_argument("var")
     args = parser.parse_args()
-    print(args)
-    p = subprocess.check_output(["ansible", args.host, "-m", "debug", "-a", f"var={args.var}"], text=True)
-    p_lines = p.splitlines()
-    host = p_lines[0].split("|")[0].strip() # dev-control | SUCCESS => {
-    json_data = json.loads("{" + "\n".join(p.splitlines()[1:]))
-    out = json_data[args.var]
-    print(json.dumps(out, indent=2))
+    debug_stdout = subprocess.check_output(["ansible", args.host, "-m", "debug", "-a", f"var={args.var}"], text=True)
+    debug_stdout_lines = debug_stdout.splitlines()
+    host = debug_stdout_lines[0].split("|")[0].strip() # dev-control | SUCCESS => {
+    json_data = json.loads("{" + "\n".join(debug_stdout_lines[1:]))
+    value = json_data[args.var]
+    
+    if not args.debug:
+        if isinstance(value, str):
+            print(value)
+        else:
+            print(json.dumps(value, indent=2))
     
     if args.debug:
-        x = subprocess.check_output(["ansible-inventory", "--host", host], text=True)
-        json_x = json.loads(x)[args.var]
-        print("final expression:", repr(json_x))
+        
+        cfg = load_ansible_cfg()
+        inventory_paths = cfg["DEFAULT_HOST_LIST"]
+        roles_paths = cfg["DEFAULT_ROLES_PATH"]
+        collections_paths = cfg["COLLECTIONS_PATHS"]
+
+        # TODO: might be better to use word boundaries?!
+        yml_pattern = args.var + (":" if not args.all else "")
+        ini_pattern = args.var + ("=" if not args.all else "")
+
+        print()
+        print("role defaults:")
+        #print("roles_path:", roles_paths)
+        for path in roles_paths:
+            for subpath, match in grep_yml(yml_pattern, path, "*/defaults/**/*.yml"):
+                pprint_match(subpath, match, yml_pattern)
+        # TODO:
+        #print("collections_paths:", collections_paths)
+        
+        print()
+        print("inventories:")
+        #print("inventory_paths:", inventory_paths)
+        # TODO: ini_pattern
+        for path in inventory_paths:
+            for subpath, match in grep_yml(ini_pattern, path, "hosts"):
+                pprint_match(subpath, match, ini_pattern)
+        for path in inventory_paths:
+                    for subpath, match in grep_yml(yml_pattern, path, "*.yml"):
+                        pprint_match(subpath, match, yml_pattern)
+        for path in inventory_paths:
+            for subpath, match in grep_yml(yml_pattern, path, "group_vars/all/*.yml"):
+                pprint_match(subpath, match, yml_pattern)
+
+        print()
+        print("final:")
+        inventory_stdout = subprocess.check_output(["ansible-inventory", "--host", host], text=True)
+        json_inventory = json.loads(inventory_stdout)
+        if args.var in json_inventory:
+            print("  expression:", json_inventory[args.var]) # TODO: also print as json? Or yaml??
+        
+        print("  value:", json.dumps(value, indent=2))
+
